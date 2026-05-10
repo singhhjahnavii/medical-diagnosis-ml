@@ -116,23 +116,37 @@ export default function App() {
   }, []);
 
   const handlePredict = async () => {
-    setLoading(true); setError(null); setSubmitted(true);
-    try {
-      const res = await fetch(`${API_BASE}/predict`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(values),
-      });
-      const data = await res.json();
-      if (data.error) throw new Error(data.error);
-      setResult(data);
-      setTab("result");
-    } catch (e) {
-      setError(e.message || "Could not connect to backend. Is Flask running?");
-    } finally {
-      setLoading(false);
+  setLoading(true); setError(null); setSubmitted(true);
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 60000);
+    
+    setError("⏳ Backend is waking up on Render's free tier... please wait up to 30 seconds.");
+    
+    const res = await fetch(`${API_BASE}/predict`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(values),
+      signal: controller.signal,
+    });
+    
+    clearTimeout(timeout);
+    setError(null);
+    
+    const data = await res.json();
+    if (data.error) throw new Error(data.error);
+    setResult(data);
+    setTab("result");
+  } catch (e) {
+    if (e.name === "AbortError") {
+      setError("⚠ Backend took too long to respond. Please click Run Prediction again — it should work now that it's awake.");
+    } else {
+      setError("⚠ Could not connect to backend. Please try again in 30 seconds.");
     }
-  };
+  } finally {
+    setLoading(false);
+  }
+};
 
   const metrics = modelInfo?.metrics;
   const cm = metrics?.confusion_matrix;
