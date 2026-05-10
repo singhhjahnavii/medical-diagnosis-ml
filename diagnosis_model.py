@@ -1,172 +1,187 @@
-from flask import Flask, request, jsonify, render_template_string
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 import pandas as pd
+import numpy as np
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, classification_report
+from sklearn.metrics import (
+    accuracy_score, classification_report,
+    confusion_matrix, f1_score, recall_score, precision_score
+)
+from imblearn.over_sampling import SMOTE
 import os
+import json
 
 app = Flask(__name__)
+CORS(app)  # Allow React frontend to call this API
 
-# Load and train model on startup
-print("Loading and training model...")
-
-# Load dataset
+# ─────────────────────────────────────────────
+# 1. DATA ENGINEERING
+# ─────────────────────────────────────────────
+print("Loading and preprocessing dataset...")
 data = pd.read_csv("dataset/diabetes.csv")
 
-# Replace 0 with NaN in medical columns
+# Medical columns where 0 is physiologically impossible → treat as missing
 cols_with_zero = ["Glucose", "BloodPressure", "SkinThickness", "Insulin", "BMI"]
 data[cols_with_zero] = data[cols_with_zero].replace(0, pd.NA)
-
-# Fill missing values with column mean
 data = data.apply(pd.to_numeric, errors="coerce")
 data.fillna(data.mean(), inplace=True)
 
-# Split features and target
 X = data.drop("Outcome", axis=1)
 y = data["Outcome"]
 
-# Train-test split
+feature_names = list(X.columns)
+
 X_train, X_test, y_train, y_test = train_test_split(
-    X, y, test_size=0.2, random_state=42
+    X, y, test_size=0.2, random_state=42, stratify=y
 )
 
-# Feature scaling
+# ─────────────────────────────────────────────
+# 2. SMOTE — balance the training set only
+# ─────────────────────────────────────────────
+print(f"Class distribution before SMOTE: {dict(y_train.value_counts())}")
+smote = SMOTE(random_state=42)
+X_train_resampled, y_train_resampled = smote.fit_resample(X_train, y_train)
+print(f"Class distribution after SMOTE:  {dict(pd.Series(y_train_resampled).value_counts())}")
+
+# ─────────────────────────────────────────────
+# 3. SCALING
+# ─────────────────────────────────────────────
 scaler = StandardScaler()
-X_train_scaled = scaler.fit_transform(X_train)
-X_test_scaled = scaler.transform(X_test)
+X_train_scaled = scaler.fit_transform(X_train_resampled)
+X_test_scaled  = scaler.transform(X_test)
 
-# Logistic Regression model
-model = LogisticRegression()
-model.fit(X_train_scaled, y_train)
+# ─────────────────────────────────────────────
+# 4. MODEL — Logistic Regression
+# ─────────────────────────────────────────────
+model = LogisticRegression(max_iter=1000, random_state=42)
+model.fit(X_train_scaled, y_train_resampled)
 
-# Calculate accuracy
-y_pred = model.predict(X_test_scaled)
-accuracy = accuracy_score(y_test, y_pred)
+# ─────────────────────────────────────────────
+# 5. THRESHOLD TUNING — prioritise Recall
+#    Default threshold = 0.5 → lower to 0.35 so
+#    the model flags borderline diabetic cases
+# ─────────────────────────────────────────────
+THRESHOLD = 0.35
 
-print(f"Model trained! Accuracy: {accuracy}")
+y_proba  = model.predict_proba(X_test_scaled)[:, 1]
+y_pred   = (y_proba >= THRESHOLD).astype(int)
 
-# HTML template for home page
-HTML_TEMPLATE = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Diabetes Prediction API</title>
-    <style>
-        body { font-family: Arial; max-width: 800px; margin: 50px auto; padding: 20px; }
-        h1 { color: #333; }
-        .info { background: #f0f0f0; padding: 15px; border-radius: 5px; }
-        code { background: #e0e0e0; padding: 2px 5px; border-radius: 3px; }
-    </style>
-</head>
-<body>
-    <h1>🏥 Diabetes Prediction API</h1>
-    <div class="info">
-        <p><strong>Model Accuracy:</strong> {{ accuracy }}%</p>
-        <p><strong>Status:</strong> Running ✅</p>
-    </div>
-    
-    <h2>API Endpoints:</h2>
-    <ul>
-        <li><code>GET /</code> - This page</li>
-        <li><code>GET /health</code> - Health check</li>
-        <li><code>POST /predict</code> - Make prediction</li>
-        <li><code>GET /model-info</code> - Model details</li>
-    </ul>
-    
-    <h2>Example Prediction Request:</h2>
-    <pre>
-POST /predict
-Content-Type: application/json
+# ─────────────────────────────────────────────
+# 6. EVALUATION METRICS
+# ─────────────────────────────────────────────
+cm        = confusion_matrix(y_test, y_pred)
+tn, fp, fn, tp = cm.ravel()
 
-{
-  "Pregnancies": 6,
-  "Glucose": 148,
-  "BloodPressure": 72,
-  "SkinThickness": 35,
-  "Insulin": 0,
-  "BMI": 33.6,
-  "DiabetesPedigreeFunction": 0.627,
-  "Age": 50
+metrics = {
+    "accuracy":        round(accuracy_score(y_test, y_pred) * 100, 2),
+    "recall":          round(recall_score(y_test, y_pred)   * 100, 2),
+    "precision":       round(precision_score(y_test, y_pred, zero_division=0) * 100, 2),
+    "f1_score":        round(f1_score(y_test, y_pred)       * 100, 2),
+    "threshold":       THRESHOLD,
+    "confusion_matrix": {
+        "true_negative":  int(tn),
+        "false_positive": int(fp),
+        "false_negative": int(fn),  # missed diabetic patients — the danger zone
+        "true_positive":  int(tp),
+    },
+    "dataset": {
+        "total":       int(len(data)),
+        "train_orig":  int(len(X_train)),
+        "train_smote": int(len(X_train_resampled)),
+        "test":        int(len(X_test)),
+    },
+    "class_report": classification_report(y_test, y_pred, output_dict=True),
 }
-    </pre>
-    
-    <h2>Test It:</h2>
-    <p>Use curl or Postman to test the API:</p>
-    <pre>curl -X POST {{ url }}/predict -H "Content-Type: application/json" -d '{"Pregnancies":6,"Glucose":148,"BloodPressure":72,"SkinThickness":35,"Insulin":0,"BMI":33.6,"DiabetesPedigreeFunction":0.627,"Age":50}'</pre>
-</body>
-</html>
-"""
 
-@app.route('/')
-def home():
-    return render_template_string(HTML_TEMPLATE, 
-                                 accuracy=round(accuracy * 100, 2),
-                                 url=request.url_root.rstrip('/'))
+print(f"\n{'='*50}")
+print(f"  Accuracy  : {metrics['accuracy']}%")
+print(f"  Recall    : {metrics['recall']}%  ← minimise False Negatives")
+print(f"  Precision : {metrics['precision']}%")
+print(f"  F1-Score  : {metrics['f1_score']}%")
+print(f"  Threshold : {THRESHOLD}")
+print(f"  FN (missed diabetics): {fn}")
+print(f"{'='*50}\n")
 
-@app.route('/health')
+# ─────────────────────────────────────────────
+# ROUTES
+# ─────────────────────────────────────────────
+
+@app.route("/health")
 def health():
-    return jsonify({
-        'status': 'healthy',
-        'model': 'Logistic Regression',
-        'accuracy': round(accuracy * 100, 2)
-    })
+    return jsonify({"status": "healthy", "model": "Logistic Regression + SMOTE"})
 
-@app.route('/model-info')
+
+@app.route("/model-info")
 def model_info():
     return jsonify({
-        'model_type': 'Logistic Regression',
-        'accuracy': round(accuracy * 100, 2),
-        'features': list(X.columns),
-        'dataset_size': len(data),
-        'train_size': len(X_train),
-        'test_size': len(X_test)
+        "model_type": "Logistic Regression",
+        "improvements": ["SMOTE oversampling", "StandardScaler", f"Threshold={THRESHOLD} (recall-optimised)"],
+        "features": feature_names,
+        "metrics": metrics,
     })
 
-@app.route('/predict', methods=['POST'])
+
+@app.route("/predict", methods=["POST"])
 def predict():
     try:
-        # Get JSON data
         input_data = request.json
-        
-        # Expected features
-        expected_features = ["Pregnancies", "Glucose", "BloodPressure", 
-                           "SkinThickness", "Insulin", "BMI", 
-                           "DiabetesPedigreeFunction", "Age"]
-        
-        # Validate input
-        if not all(feature in input_data for feature in expected_features):
-            return jsonify({
-                'error': 'Missing required features',
-                'required': expected_features
-            }), 400
-        
-        # Create DataFrame with input
-        input_df = pd.DataFrame([input_data])
-        
-        # Scale features
+
+        expected_features = [
+            "Pregnancies", "Glucose", "BloodPressure",
+            "SkinThickness", "Insulin", "BMI",
+            "DiabetesPedigreeFunction", "Age",
+        ]
+
+        missing = [f for f in expected_features if f not in input_data]
+        if missing:
+            return jsonify({"error": "Missing features", "missing": missing}), 400
+
+        input_df     = pd.DataFrame([{f: input_data[f] for f in expected_features}])
         input_scaled = scaler.transform(input_df)
-        
-        # Make prediction
-        prediction = model.predict(input_scaled)[0]
-        probability = model.predict_proba(input_scaled)[0]
-        
-        # Return result
+
+        proba      = model.predict_proba(input_scaled)[0]
+        diabetic_p = float(proba[1])
+        prediction = int(diabetic_p >= THRESHOLD)
+
+        # Risk tier for the UI risk meter
+        if diabetic_p < 0.30:
+            risk_level = "Low"
+            risk_color = "#22c55e"
+        elif diabetic_p < 0.55:
+            risk_level = "Moderate"
+            risk_color = "#f59e0b"
+        elif diabetic_p < 0.75:
+            risk_level = "High"
+            risk_color = "#f97316"
+        else:
+            risk_level = "Critical"
+            risk_color = "#ef4444"
+
         return jsonify({
-            'prediction': int(prediction),
-            'result': 'Diabetic' if prediction == 1 else 'Non-Diabetic',
-            'probability': {
-                'non_diabetic': round(float(probability[0]) * 100, 2),
-                'diabetic': round(float(probability[1]) * 100, 2)
+            "prediction":  prediction,
+            "result":      "Diabetic" if prediction == 1 else "Non-Diabetic",
+            "probability": {
+                "non_diabetic": round(float(proba[0]) * 100, 2),
+                "diabetic":     round(diabetic_p       * 100, 2),
             },
-            'confidence': round(float(max(probability)) * 100, 2)
+            "confidence":  round(float(max(proba)) * 100, 2),
+            "threshold":   THRESHOLD,
+            "risk_level":  risk_level,
+            "risk_color":  risk_color,
+            "risk_score":  round(diabetic_p * 100, 1),
+            "note": (
+                "Flagged due to recall-optimised threshold. "
+                "Recommend follow-up test." if prediction == 1 and diabetic_p < 0.5
+                else ""
+            ),
         })
-        
+
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+        return jsonify({"error": str(e)}), 500
 
 
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False)
