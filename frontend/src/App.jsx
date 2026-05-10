@@ -1,7 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 
-const API_BASE = "http://localhost:5000";
-
+const API_BASE = "https://medical-diagnosis-ml.onrender.com";
 const FIELDS = [
   { key: "Pregnancies", label: "Pregnancies", min: 0, max: 20, step: 1, unit: "count", tip: "Number of times pregnant" },
   { key: "Glucose", label: "Plasma Glucose", min: 0, max: 300, step: 1, unit: "mg/dL", tip: "2-hr oral glucose tolerance test" },
